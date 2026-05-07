@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/venv/bin/python /root/trading-bot/scheduler.py
+Restart=always
+RestartSec=10
+KillSignal=SIGKILL
+TimeoutStopSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/root/trading-bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
