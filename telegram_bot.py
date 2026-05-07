@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
 from loguru import logger
 
 from config import config
@@ -16,138 +17,190 @@ WATCHLIST = [
 ]
 
 
-def format_rupiah(value: float) -> str:
-    if abs(value) >= 1_000_000_000:
-        return f"Rp {value/1_000_000_000:.2f}B"
-    elif abs(value) >= 1_000_000:
-        return f"Rp {value/1_000_000:.2f}M"
-    return f"Rp {value:,.0f}"
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
+def _rp(value: float) -> str:
+    if abs(value) >= 1_000_000_000:
+        return f"Rp{value/1_000_000_000:+.2f}B"
+    elif abs(value) >= 1_000_000:
+        return f"Rp{value/1_000_000:.2f}M"
+    return f"Rp{value:,.0f}"
+
+
+def _signal_icon(signal: str) -> str:
+    return {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(signal, "⚪")
+
+
+def _bar(value: float, max_val: float = 1.0, width: int = 10) -> str:
+    pct = min(abs(value) / max(max_val, 0.01), 1.0)
+    filled = int(pct * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+# ─── /start ────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Trading Bot Assistant*\n\n"
-        "Perintah yang tersedia:\n"
-        "/status — Cek posisi & PnL\n"
-        "/analyze <SYMBOL> — Analisis saham\n"
-        "/watchlist — Cek watchlist\n"
-        "/risk — Cek manajemen risiko\n"
-        "/summary — Ringkasan pasar harian\n"
-        "/chat <pertanyaan> — Tanya AI\n"
-        "/help — Bantuan"
+        "🤖 <b>Trading Bot</b>\n\n"
+        "┌─────────────────────┐\n"
+        "│ <b>Perintah</b>                            │\n"
+        "├─────────────────────┤\n"
+        "│ /status   Cek posisi           │\n"
+        "│ /analyze  Analisis saham       │\n"
+        "│ /list        Lihat watchlist      │\n"
+        "│ /risk        Cek risiko              │\n"
+        "│ /ai           Tanya AI langsung  │\n"
+        "│ /help        Bantuan                  │\n"
+        "└─────────────────────┘"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+
+# ─── /status ────────────────────────────────────────────────────────
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session()
     try:
         positions = session.query(Position).all()
-        risk_summary = risk_manager.get_risk_summary()
-
-        msg = "*📊 Portfolio Status*\n\n"
+        risk = risk_manager.get_risk_summary()
 
         if positions:
+            lines = ["<b>📊 Posisi Aktif</b>\n"]
             for p in positions:
-                value = p.quantity * (p.current_price or p.avg_price)
-                pnl = p.quantity * ((p.current_price or p.avg_price) - p.avg_price)
-                pnl_pct = ((p.current_price or p.avg_price) - p.avg_price) / p.avg_price * 100
-                msg += (
-                    f"*{p.symbol}*: {p.quantity} lot @ {format_rupiah(p.avg_price)}\n"
-                    f"  Value: {format_rupiah(value)} | PnL: {format_rupiah(pnl)} ({pnl_pct:+.1f}%)\n\n"
+                price = p.current_price or p.avg_price
+                value = p.quantity * price
+                pnl = p.quantity * (price - p.avg_price)
+                pnl_pct = (price - p.avg_price) / p.avg_price
+                icon = "🔺" if pnl > 0 else "🔻" if pnl < 0 else "➖"
+                lines.append(
+                    f"{icon} <code>{_escape_html(p.symbol)}</code> "
+                    f"{p.quantity} lot @ {_rp(p.avg_price)}\n"
+                    f"     PnL: {_rp(pnl)} ({pnl_pct:+.1%})"
                 )
+            msg_positions = "\n\n".join(lines)
         else:
-            msg += "Tidak ada posisi aktif.\n\n"
+            msg_positions = "<b>📊 Posisi</b>\nTidak ada posisi aktif."
 
-        msg += (
-            "— — — — — — — — — —\n"
-            f"*Capital*: {format_rupiah(risk_summary['current_capital'])}\n"
-            f"*Daily PnL*: {format_rupiah(risk_summary['daily_pnl'])} ({risk_summary['daily_pnl_percent']:+.2%})\n"
-            f"*Max DD*: {risk_summary['max_drawdown']:.2%}\n"
+        total_return = risk["total_return"]
+        ret_icon = "🔺" if total_return > 0 else "🔻" if total_return < 0 else "➖"
+
+        msg_risk = (
+            f"\n\n<b>💰 Modal</b>\n"
+            f"    {_rp(risk['current_capital'])} {ret_icon} {total_return:+.2%}\n"
+            f"\n<b>📅 Hari Ini</b>\n"
+            f"    PnL: {_rp(risk['daily_pnl'])} ({risk['daily_pnl_percent']:+.2%})\n"
+            f"    DD:  {risk['max_drawdown']:.1%}  {_bar(risk['max_drawdown'], 1.0, 6)}\n"
         )
 
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(msg_positions + msg_risk, parse_mode=ParseMode.HTML)
     finally:
         session.close()
 
 
+# ─── /analyze ───────────────────────────────────────────────────────
+
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Gunakan: /analyze <SYMBOL>\nContoh: /analyze BBCA")
+        await update.message.reply_text("⚡ /analyze BBCA")
         return
 
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"🔍 Menganalisis {symbol}...")
+    msg_wait = await update.message.reply_text(f"🔍 {symbol}...")
 
     result = await analyze_stock(symbol)
+    signal = result.get("signal", "HOLD")
+    conf = result.get("confidence", 0)
+    target = result.get("price_target")
+    stop = result.get("stop_loss")
+    rr = result.get("risk_reward_ratio", 0)
+    reason = result.get("reason", "N/A")
 
-    msg = (
-        f"*📈 {result.get('symbol', symbol)}*\n\n"
-        f"*Signal*: {result.get('signal', 'HOLD')}\n"
-        f"*Confidence*: {result.get('confidence', 0):.0%}\n"
-        f"*Target Price*: {format_rupiah(result.get('price_target', 0)) if result.get('price_target') else 'N/A'}\n"
-        f"*Stop Loss*: {format_rupiah(result.get('stop_loss', 0)) if result.get('stop_loss') else 'N/A'}\n"
-        f"*R/R Ratio*: {result.get('risk_reward_ratio', 'N/A')}\n\n"
-        f"*Alasan*: {result.get('reason', 'N/A')}"
+    out = (
+        f"{_signal_icon(signal)} <b>{_escape_html(symbol)} — {signal}</b>\n"
+        f"<pre>Confidence : {conf:.0%}</pre>\n"
+        f"<pre>Target     : {_rp(target) if target else 'N/A'}</pre>\n"
+        f"<pre>Stop Loss  : {_rp(stop) if stop else 'N/A'}</pre>\n"
+        f"<pre>R/R Ratio  : {rr if rr else 'N/A'}</pre>\n"
+        f"\n{_escape_html(reason[:300])}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    await msg_wait.edit_text(out, parse_mode=ParseMode.HTML)
 
 
-async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Menganalisis watchlist...")
+# ─── /list ──────────────────────────────────────────────────────────
 
-    tasks = [analyze_stock(s) for s in WATCHLIST]
-    results = await asyncio.gather(*tasks)
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔍 Menganalisis...")
 
-    msg = "*📋 Watchlist Analysis*\n\n"
+    results = []
+    batch = WATCHLIST[:5]
+    for s in batch:
+        r = await analyze_stock(s)
+        results.append(r)
+
+    lines = ["<b>📋 Sinyal Hari Ini</b>\n"]
     for r in results:
-        signal_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(r.get("signal", "HOLD"), "⚪")
-        msg += f"{signal_emoji} *{r.get('symbol')}*: {r.get('signal')} ({r.get('confidence', 0):.0%})\n"
-        if r.get("reason"):
-            msg += f"  _{r['reason'][:80]}_\n"
+        sym = r.get("symbol", "?")
+        sig = r.get("signal", "HOLD")
+        conf = r.get("confidence", 0)
+        reason = (r.get("reason", "") or "")[:60]
+        lines.append(
+            f"{_signal_icon(sig)} <code>{_escape_html(sym)}</code> "
+            f"<b>{sig}</b> {conf:.0%}"
+        )
+        if reason:
+            lines.append(f"     {_escape_html(reason)}")
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    out = "\n".join(lines)
+    out += f"\n\n<i>5 dari {len(WATCHLIST)} saham. Ulangi untuk refresh.</i>"
 
+    await msg.edit_text(out, parse_mode=ParseMode.HTML)
+
+
+# ─── /risk ──────────────────────────────────────────────────────────
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    summary = risk_manager.get_risk_summary()
-
-    total_return = summary["total_return"]
-    emoji = "🟢" if total_return > 0 else "🔴" if total_return < 0 else "⚪"
+    s = risk_manager.get_risk_summary()
+    ret = s["total_return"]
+    icon = "🟢" if ret > 0 else "🔴" if ret < 0 else "⚪"
 
     msg = (
-        "*⚠️ Risk Management*\n\n"
-        f"Capital: {format_rupiah(summary['current_capital'])}\n"
-        f"Return: {emoji} {total_return:+.2%}\n"
-        f"Daily PnL: {format_rupiah(summary['daily_pnl'])} ({summary['daily_pnl_percent']:+.2%})\n"
-        f"Max Drawdown: {summary['max_drawdown']:.2%}\n"
-        f"Position Limit: {summary['max_position_size']:.0%}\n"
-        f"Daily Loss Limit: {summary['max_daily_loss']:.0%}\n"
+        "<b>⚠️ Risk Manager</b>\n"
+        f"<pre>Modal      {_rp(s['current_capital'])}</pre>\n"
+        f"<pre>Return     {icon} {ret:+.2%}</pre>\n"
+        f"<pre>PnL Hari Ini {_rp(s['daily_pnl'])} ({s['daily_pnl_percent']:+.2%})</pre>\n"
+        f"<pre>Max DD     {s['max_drawdown']:.1%}</pre>\n"
+        f"<pre>Batas Posisi  {s['max_position_size']:.0%} / trade</pre>\n"
+        f"<pre>Batas Loss Harian {s['max_daily_loss']:.0%}</pre>"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📝 Membuat ringkasan pasar...")
-    result = await daily_market_summary(WATCHLIST)
-    await update.message.reply_text(result)
-
+# ─── /ai ────────────────────────────────────────────────────────────
 
 async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Gunakan: /chat <pertanyaan>\nContoh: /chat Apakah IHSG sedang bearish?")
+        await update.message.reply_text("⚡ /ai Apakah BBCA layak beli hari ini?")
         return
 
     question = " ".join(context.args)
-    await update.message.reply_text("🤔 Berpikir...")
+    msg_wait = await update.message.reply_text("...")
 
     response = await chat_with_ai(question)
-    await update.message.reply_text(response)
+    safe = _escape_html(response[:3800])
 
+    await msg_wait.edit_text(safe, parse_mode=ParseMode.HTML)
+
+
+# ─── /help ──────────────────────────────────────────────────────────
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
+
+# ─── main ───────────────────────────────────────────────────────────
 
 def run_telegram_bot():
     if not config.TELEGRAM_BOT_TOKEN:
@@ -160,9 +213,10 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("watchlist", list_cmd))
     app.add_handler(CommandHandler("risk", risk_cmd))
-    app.add_handler(CommandHandler("summary", summary_cmd))
+    app.add_handler(CommandHandler("ai", chat_cmd))
     app.add_handler(CommandHandler("chat", chat_cmd))
 
     logger.info("Telegram bot started")
@@ -170,7 +224,6 @@ def run_telegram_bot():
 
 
 if __name__ == "__main__":
-    from loguru import logger
     import sys
     logger.remove()
     logger.add(sys.stdout, level="INFO")
